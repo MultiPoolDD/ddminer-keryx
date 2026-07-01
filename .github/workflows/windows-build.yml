@@ -75,16 +75,24 @@ jobs:
 
       - name: Assemble bundle
         shell: pwsh
+        env:
+          CUDA_PATH: ${{ steps.cuda.outputs.CUDA_PATH }}
         run: |
           $out = "ddminer-win-x64"
           New-Item -ItemType Directory -Force $out | Out-Null
           Copy-Item keryx-miner/target/release/ddminer.exe $out/
           # plugin dll (Windows cdylib has no 'lib' prefix)
           Copy-Item keryx-miner/target/release/keryxcuda.dll $out/
-          # CUDA runtime DLLs from the toolkit
-          $cudabin = "$env:CUDA_PATH\bin"
-          foreach ($p in @("cudart64_*.dll","curand64_*.dll","cublas64_*.dll","cublasLt64_*.dll")) {
-            Copy-Item "$cudabin\$p" $out/ -ErrorAction SilentlyContinue
+          # CUDA runtime DLLs: search the whole toolkit (CUDA 13 moved them out of \bin) and copy the
+          # newest match for each. Fail loudly if a required lib is missing so we never ship an
+          # incomplete self-contained bundle.
+          $roots = @("$env:CUDA_PATH", "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA") | Where-Object { $_ -and (Test-Path $_) }
+          foreach ($stem in @("cudart64_","curand64_","cublas64_","cublasLt64_")) {
+            $dll = Get-ChildItem -Path $roots -Recurse -Filter "$stem*.dll" -ErrorAction SilentlyContinue |
+                   Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($null -eq $dll) { Write-Error "Required CUDA DLL '$stem*.dll' not found under $($roots -join ', ')"; exit 1 }
+            Copy-Item $dll.FullName $out/
+            Write-Host "bundled $($dll.Name)"
           }
           # launcher
           @"
