@@ -606,11 +606,17 @@ async fn main() -> Result<(), Error> {
             Vec::new()
         };
     keryx_miner::slm::set_v2_lineup(specs_v2);
-    keryx_miner::slm::init_supported(specs_v1);
+    // Serve the post-hardfork (PoM/uncensored) lineup from the start. Mainnet is permanently past
+    // OPOI_V2_ACTIVATION_DAA, so the legacy specs_v1 lineup is never mined/served. Registering it at
+    // connect made `declare_capabilities()` announce ZERO models to the pool (specs_v1 is never
+    // prefetched → no `.ok` → loaded_model_ids() empty), so the pool OPoI-kicked us in a reconnect
+    // loop before ever sending a job. Announcing the downloaded v2 lineup here fixes the pool path.
+    // (advance_lineup_if_due still fires a harmless redundant re-declare on the first post-H notify.)
+    keryx_miner::slm::init_supported(specs_v2);
     info!(
-        "OPoI Phase-3 active — {} legacy + {} uncensored model(s) staged, DAA-gated at {}.",
-        specs_v1.len(),
+        "OPoI Phase-3 active — serving {} PoM model(s) ({} legacy staged), DAA-gated at {}.",
         specs_v2.len(),
+        specs_v1.len(),
         keryx_miner::models::OPOI_V2_ACTIVATION_DAA
     );
     info!("Prefetching model files before mining starts…");
