@@ -1,0 +1,105 @@
+name: Windows build
+
+# Builds ddminer.exe + keryxcuda.dll on a Windows runner and packages a
+# self-contained Windows bundle (CUDA DLLs included). Runtime needs an NVIDIA
+# GPU + driver; the runner has no GPU, so this BUILDS but does not TEST.
+# Trigger manually from the Actions tab (Run workflow) or via `gh workflow run`.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'win-*'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit (Windows)
+        uses: Jimver/cuda-toolkit@v0.2.19
+        id: cuda
+        with:
+          cuda: '12.6.2'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "thrust", "visual_studio_integration"]'
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rust toolchain (MSVC)
+        run: |
+          rustup default stable-x86_64-pc-windows-msvc
+          rustc -vV
+          cargo -vV
+
+      - name: Show CUDA
+        shell: pwsh
+        run: |
+          echo "CUDA_PATH=$env:CUDA_PATH"
+          & "$env:CUDA_PATH\bin\nvcc.exe" --version
+
+      - name: Build ddminer.exe + keryxcuda.dll
+        working-directory: keryx-miner
+        shell: pwsh
+        env:
+          CUDA_PATH: ${{ steps.cuda.outputs.CUDA_PATH }}
+          CUDA_ROOT: ${{ steps.cuda.outputs.CUDA_PATH }}
+        run: |
+          cargo build --release --bin ddminer
+          cargo build --release -p keryxcuda
+
+      - name: Assemble bundle
+        shell: pwsh
+        run: |
+          $out = "ddminer-win-x64"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item keryx-miner/target/release/ddminer.exe $out/
+          # plugin dll (Windows cdylib has no 'lib' prefix)
+          Copy-Item keryx-miner/target/release/keryxcuda.dll $out/
+          # CUDA runtime DLLs from the toolkit
+          $cudabin = "$env:CUDA_PATH\bin"
+          foreach ($p in @("cudart64_*.dll","curand64_*.dll","cublas64_*.dll","cublasLt64_*.dll")) {
+            Copy-Item "$cudabin\$p" $out/ -ErrorAction SilentlyContinue
+          }
+          # launcher
+          @"
+          @echo off
+          rem DDMiner Keryx (Windows). Edit YOUR_ADDRESS below, then run this file.
+          rem No flag = AUTO (each GPU mines the max tier its VRAM fits).
+          ddminer.exe -a keryx:YOUR_ADDRESS %*
+          pause
+          "@ | Set-Content -Encoding ascii "$out/start.bat"
+          @"
+          DDMiner Keryx - Windows build (by Multipool DDMiner)
+          ====================================================
+          Requirements: NVIDIA driver installed. CUDA toolkit NOT needed
+          (the CUDA DLLs are bundled next to ddminer.exe).
+
+          RUN:
+            ddminer.exe -a keryx:YOUR_ADDRESS
+            ddminer.exe -a keryx:YOUR_ADDRESS -s stratum+tcp://your-pool:5555
+            ddminer.exe -a keryx:YOUR_ADDRESS --high
+
+          First run downloads the model lineup into .\models (IPFS/kubo is
+          fetched automatically). An escrow key is generated as escrow.key -
+          it is YOURS, back it up, never share it.
+          "@ | Set-Content -Encoding ascii "$out/README.txt"
+          Get-ChildItem $out
+
+      - name: Verify binary has no missing DLLs (dumpbin)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $out = "ddminer-win-x64"
+          Get-ChildItem "$out\*.dll" | ForEach-Object { $_.Name }
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ddminer-win-x64
+          path: ddminer-win-x64
+          retention-days: 30
