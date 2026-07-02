@@ -4,8 +4,9 @@
 export LC_ALL=C
 
 # Source the manifest from THIS script's own dir, so it works regardless of the install dir name
-# HiveOS uses (keryx-miner vs keryx-miner-0.5.2, etc.).
-. "$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/h-manifest.conf"
+# HiveOS uses. MUST be BASH_SOURCE, not $0: the HiveOS agent *sources* h-stats.sh, so $0 is the
+# agent's path and the manifest silently failed to load → khs=0 / stats=null → empty dashboard.
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)/h-manifest.conf"
 
 LOG="$CUSTOM_LOG_BASENAME.log"
 
@@ -42,15 +43,16 @@ to_khs() {
 if [ "$diffTime" -lt "$maxDelay" ] && [ -n "$stats_raw" ]; then
 	total_khs=`to_khs "$stats_raw"`
 
-	# GPU status from HiveOS (busids/brand/temp/fan), aligned to the miner's mining GPUs only.
-	readarray -t gpu_stats < <( jq --slurp -r -c '.[] | .busids, .brand, .temp, .fan | join(" ")' $GPU_STATS_JSON 2>/dev/null)
+	# GPU status from HiveOS (busids/brand/temp/fan/power), aligned to the miner's mining GPUs only.
+	readarray -t gpu_stats < <( jq --slurp -r -c '.[] | .busids, .brand, .temp, .fan, .power | join(" ")' $GPU_STATS_JSON 2>/dev/null)
 	busids=(${gpu_stats[0]})
 	brands=(${gpu_stats[1]})
 	temps=(${gpu_stats[2]})
 	fans=(${gpu_stats[3]})
+	powers=(${gpu_stats[4]})
 	gpu_count=${#busids[@]}
 
-	hash_arr=(); busid_arr=(); fan_arr=(); temp_arr=()
+	hash_arr=(); busid_arr=(); fan_arr=(); temp_arr=(); power_arr=()
 
 	if [ $(gpu-detect NVIDIA) -gt 0 ]; then
 		BRAND_MINER="nvidia"
@@ -67,6 +69,7 @@ if [ "$diffTime" -lt "$maxDelay" ] && [ -n "$stats_raw" ]; then
 		busid_arr+=($((16#${BASH_REMATCH[1]})))
 		temp_arr+=(${temps[i]})
 		fan_arr+=(${fans[i]})
+		power_arr+=(${powers[i]:-0})
 		gpu_raw=`grep "Device #$m:" "$LOG" 2>/dev/null | tail -n 1`
 		hash_arr+=(`to_khs "$gpu_raw"`)
 		m=$((m+1))
@@ -76,6 +79,7 @@ if [ "$diffTime" -lt "$maxDelay" ] && [ -n "$stats_raw" ]; then
 	bus_numbers=`printf '%s\n' "${busid_arr[@]}" | jq -cs '.'`
 	fan_json=`printf '%s\n' "${fan_arr[@]}" | jq -cs '.'`
 	temp_json=`printf '%s\n' "${temp_arr[@]}" | jq -cs '.'`
+	power_json=`printf '%s\n' "${power_arr[@]}" | jq -cs '.'`
 
 	# Accepted / rejected shares for the `ar` field.
 	shares_raw=`grep "Shares total:" "$LOG" 2>/dev/null | tail -n 1`
@@ -92,10 +96,11 @@ if [ "$diffTime" -lt "$maxDelay" ] && [ -n "$stats_raw" ]; then
 		--argjson bus_numbers "$bus_numbers" \
 		--argjson fan "$fan_json" \
 		--argjson temp "$temp_json" \
+		--argjson power "$power_json" \
 		--argjson acc "$acc" \
 		--argjson rej "$rej" \
 		--arg uptime "$uptime" \
-		'{ hs: $hs, hs_units: "khs", algo: "keryxhash", ver: $ver, ar: [$acc, $rej], $uptime, $bus_numbers, $temp, $fan }')
+		'{ hs: $hs, hs_units: "khs", algo: "keryxhash", ver: $ver, ar: [$acc, $rej], $uptime, $bus_numbers, $temp, $fan, $power }')
 	khs=$total_khs
 else
 	khs=0
