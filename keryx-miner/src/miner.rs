@@ -558,7 +558,11 @@ impl MinerManager {
         stop: Arc<AtomicBool>,
     ) {
         use std::io::{IsTerminal, Write};
+        let start = Instant::now();
         let mut last_instant = Instant::now();
+        // Lines the interactive panel drew last tick (0 = nothing yet) — the redraw moves the
+        // cursor up this many lines and repaints in place, so the panel never scrolls.
+        let mut drawn: usize = 0;
         while !stop.load(Ordering::Acquire) {
             thread::sleep(LOG_RATE);
             if stop.load(Ordering::Acquire) {
@@ -579,15 +583,9 @@ impl MinerManager {
                 }
             }
             per_gpu.sort_by_key(|(n, _)| *n);
-            let hr = if hashes == 0 {
-                if challenge_active { "OPoI challenge".to_string() } else { "warming up".to_string() }
-            } else {
-                let (rate, suffix) = Self::hash_suffix(hashes as f64 / duration);
-                format!("{:.2} {}", rate, suffix)
-            };
             // HiveOS / log mode (stdout not a TTY): emit newline-terminated, greppable stats lines
             // that h-stats.sh parses ("Device #N: X unit" per GPU + "Current hashrate is X unit").
-            // Skipped in interactive mode so the terminal only shows the compact status line.
+            // The interactive panel below is TTY-only, so logs stay clean and grep-stable.
             if !std::io::stdout().is_terminal() {
                 for (n, rate) in &per_gpu {
                     let (r, u) = Self::hash_suffix(*rate);
@@ -597,47 +595,139 @@ impl MinerManager {
                 info!("Current hashrate is {:.2} {}", tr, tu);
                 let (acc, rej) = crate::client::stratum::share_counts();
                 info!("Shares total: {} accepted, {} rejected", acc, rej);
+                continue;
             }
-            let raw_gpus = Self::gpu_status();
-            let gpus = if raw_gpus.is_empty() { "GPU n/a".to_string() } else { raw_gpus };
+
+            // ── Panel interactivo: bloque por-GPU repintado en sitio (sin scroll) ──────
+            const CY: &str = "\x1b[36m"; // cian
+            const BD: &str = "\x1b[1;36m"; // cian negrita
+            const GR: &str = "\x1b[1;32m"; // verde negrita
+            const YL: &str = "\x1b[1;33m"; // amarillo negrita
+            const RD: &str = "\x1b[1;31m"; // rojo negrita
+            const DM: &str = "\x1b[2m"; // atenuado
+            const RS: &str = "\x1b[0m"; // reset
+
+            let stats = Self::gpu_stats();
             let (acc, rej) = crate::client::stratum::share_counts();
-            // Colores ANSI SOLO si la salida es un terminal real; en logs/redirecciones, texto plano
-            // (así no ensucia el log ni rompe el grep del watchdog).
-            let (cy, gr, bd, dm, rd, rs) = if std::io::stdout().is_terminal() {
-                ("\x1b[36m", "\x1b[1;32m", "\x1b[1;36m", "\x1b[2m", "\x1b[31m", "\x1b[0m")
+            let up = start.elapsed().as_secs();
+            let uptime = if up >= 3600 {
+                format!("{}h {:02}m", up / 3600, (up / 60) % 60)
             } else {
-                ("", "", "", "", "", "")
+                format!("{}m {:02}s", up / 60, up % 60)
             };
-            let rejcol = if rej > 0 { rd } else { dm };
-            // Una sola línea, refrescada en sitio con \r (sin scroll). Padding para borrar restos.
-            print!(
-                "\r  {bd}ddminer{rs} · {gr}{hr}{rs} · {cy}{gpus}{rs} · shares {gr}{acc}{rs} acc / {rejcol}{rej}{rs} rej · {dm}0% miner fee{rs}          "
-            );
+            let sep = format!("  {DM}{}{RS}", "─".repeat(66));
+
+            let mut lines: Vec<String> = Vec::with_capacity(stats.len().max(per_gpu.len()) + 4);
+            lines.push(format!(
+                "  {BD}ddminer{RS} {DM}v{}{RS} {DM}·{RS} {CY}Keryx (KRX){RS} {DM}· PoM + OPoI · 0% fee · up {uptime}{RS}",
+                env!("CARGO_PKG_VERSION")
+            ));
+            lines.push(sep.clone());
+            // Filas por GPU: nvidia-smi manda (nombre/T/fan/W); el ratio viene del contador del
+            // worker. Sin nvidia-smi (contenedores minimalistas) caemos a filas solo-hashrate.
+            if stats.is_empty() {
+                for (n, rate) in &per_gpu {
+                    let (r, u) = Self::hash_suffix(*rate);
+                    lines.push(format!("  {CY}GPU{n}{RS}   {GR}{r:>7.2} {u}{RS}"));
+                }
+            } else {
+                for g in &stats {
+                    let rate = per_gpu.iter().find(|(n, _)| *n == g.0).map(|(_, r)| *r).unwrap_or(0.0);
+                    let hr_cell = if rate > 0.0 {
+                        let (r, u) = Self::hash_suffix(rate);
+                        format!("{GR}{r:>7.2} {u:<7}{RS}")
+                    } else if challenge_active {
+                        format!("{YL}{:<15}{RS}", "OPoI/PoM load")
+                    } else {
+                        format!("{DM}{:<15}{RS}", "—")
+                    };
+                    // Temperatura con semáforo: <70 atenuado, 70–84 amarillo, 85+ rojo.
+                    let temp_cell = match g.2 {
+                        Some(t) if t >= 85 => format!("{RD}{t:>3}°C{RS}"),
+                        Some(t) if t >= 70 => format!("{YL}{t:>3}°C{RS}"),
+                        Some(t) => format!("{DM}{t:>3}°C{RS}"),
+                        None => format!("{DM}  --°C{RS}"),
+                    };
+                    let fan_cell = match g.3 {
+                        Some(f) => format!("{DM}fan {f:>3}%{RS}"),
+                        None => format!("{DM}fan  --{RS}"),
+                    };
+                    let pow_cell = match g.4 {
+                        Some(w) => format!("{DM}{w:>3} W{RS}"),
+                        None => format!("{DM} -- W{RS}"),
+                    };
+                    lines.push(format!(
+                        "  {CY}GPU{:<2}{RS} {:<12} {}  {}  {}  {}",
+                        g.0, g.1, hr_cell, temp_cell, fan_cell, pow_cell
+                    ));
+                }
+            }
+            lines.push(sep);
+            let total_cell = if hashes == 0 {
+                if challenge_active {
+                    format!("{YL}OPoI challenge — PoW en pausa{RS}")
+                } else {
+                    format!("{DM}warming up…{RS}")
+                }
+            } else {
+                let (r, u) = Self::hash_suffix(hashes as f64 / duration);
+                format!("{GR}{r:.2} {u}{RS}")
+            };
+            let eff = if acc + rej > 0 {
+                format!(" {DM}({:.1}%){RS}", 100.0 * acc as f64 / (acc + rej) as f64)
+            } else {
+                String::new()
+            };
+            let rej_cell =
+                if rej > 0 { format!("{RD}✘ {rej}{RS}") } else { format!("{DM}✘ {rej}{RS}") };
+            lines.push(format!(
+                "  {DM}TOTAL{RS}  {total_cell}   shares {GR}✔ {acc}{RS} {rej_cell}{eff}"
+            ));
+
+            // Repintado: sube `drawn` líneas y limpia hasta el final de pantalla; así el panel
+            // vive fijo bajo el banner aunque cambie de altura (p. ej. nvidia-smi intermitente).
+            if drawn > 0 {
+                print!("\x1b[{drawn}A");
+            }
+            print!("\x1b[0J");
+            for l in &lines {
+                println!("{l}");
+            }
             let _ = std::io::stdout().flush();
+            drawn = lines.len();
         }
     }
 
-    /// Lee temperatura y fans de cada GPU (nvidia-smi) → "GPU0 72C 51%  |  GPU1 73C 49%".
-    fn gpu_status() -> String {
+    /// Telemetría por GPU vía nvidia-smi: (índice, nombre corto, temp °C, fan %, potencia W).
+    /// Los campos que nvidia-smi reporta como "[N/A]" (p. ej. fan en pasivas) llegan como None.
+    fn gpu_stats() -> Vec<(u32, String, Option<i32>, Option<u32>, Option<u32>)> {
         match std::process::Command::new("nvidia-smi")
-            .args(["--query-gpu=index,name,temperature.gpu,fan.speed", "--format=csv,noheader,nounits"])
+            .args([
+                "--query-gpu=index,name,temperature.gpu,fan.speed,power.draw",
+                "--format=csv,noheader,nounits",
+            ])
             .output()
         {
             Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
                 .lines()
                 .filter_map(|l| {
                     let f: Vec<&str> = l.split(',').map(|s| s.trim()).collect();
-                    if f.len() >= 4 {
+                    if f.len() >= 5 {
                         // nombre corto: "NVIDIA GeForce RTX 4090" -> "RTX 4090"
                         let name = f[1].replace("NVIDIA GeForce ", "").replace("NVIDIA ", "");
-                        Some(format!("GPU{} {} T:{}C F:{}%", f[0], name, f[2], f[3]))
+                        Some((
+                            f[0].parse::<u32>().ok()?,
+                            name,
+                            f[2].parse::<i32>().ok(),
+                            f[3].parse::<u32>().ok(),
+                            f[4].parse::<f64>().ok().map(|w| w.round() as u32),
+                        ))
                     } else {
                         None
                     }
                 })
-                .collect::<Vec<_>>()
-                .join("  |  "),
-            _ => String::new(),
+                .collect(),
+            _ => Vec::new(),
         }
     }
 
