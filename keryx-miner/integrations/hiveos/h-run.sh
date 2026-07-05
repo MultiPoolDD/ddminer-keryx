@@ -15,4 +15,9 @@ cd `dirname $0`
 # so this is only a belt-and-suspenders hint for the dynamic loader.
 export LD_LIBRARY_PATH="$(dirname $0):${LD_LIBRARY_PATH:-}:/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib:/usr/lib/x86_64-linux-gnu"
 
+# Enumera las GPUs CUDA en orden de bus PCI (el mismo que usa la lista de GPUs de HiveOS).
+# Sin esto CUDA usa FASTEST_FIRST y en rigs mixtos "Device #N" del log se atribuye a otra
+# tarjeta en el dashboard (hashrate/temp/fan cruzados entre GPUs).
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
 ./$CUSTOM_MINERBIN $(< $CUSTOM_CONFIG_FILENAME) $@ 2>&1 | tee $CUSTOM_LOG_BASENAME.log

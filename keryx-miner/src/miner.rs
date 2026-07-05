@@ -585,16 +585,21 @@ impl MinerManager {
             per_gpu.sort_by_key(|(n, _)| *n);
             // HiveOS / log mode (stdout not a TTY): emit newline-terminated, greppable stats lines
             // that h-stats.sh parses ("Device #N: X unit" per GPU + "Current hashrate is X unit").
-            // The interactive panel below is TTY-only, so logs stay clean and grep-stable.
+            // println! DIRECTO, no info!: el nivel por defecto del logger es Warn (TUI limpio),
+            // así que con info! estas líneas nunca llegaban al log de HiveOS → khs=0/stats=null
+            // → dashboard vacío salvo con -d. El timestamp UTC replica el formato env_logger
+            // porque h-stats.sh extrae el ISO-8601 de la línea para el chequeo de frescura.
             if !std::io::stdout().is_terminal() {
+                let ts = Self::utc_stamp();
                 for (n, rate) in &per_gpu {
                     let (r, u) = Self::hash_suffix(*rate);
-                    info!("Device #{}: {:.2} {}", n, r, u);
+                    println!("[{ts} INFO  keryx_miner::miner] Device #{}: {:.2} {}", n, r, u);
                 }
                 let (tr, tu) = if hashes == 0 { (0.0, "hash/s") } else { Self::hash_suffix(hashes as f64 / duration) };
-                info!("Current hashrate is {:.2} {}", tr, tu);
+                println!("[{ts} INFO  keryx_miner::miner] Current hashrate is {:.2} {}", tr, tu);
                 let (acc, rej) = crate::client::stratum::share_counts();
-                info!("Shares total: {} accepted, {} rejected", acc, rej);
+                println!("[{ts} INFO  keryx_miner::miner] Shares total: {} accepted, {} rejected", acc, rej);
+                let _ = std::io::stdout().flush();
                 continue;
             }
 
@@ -762,6 +767,17 @@ impl MinerManager {
     }
 
     #[inline]
+    /// Timestamp UTC "2026-07-05T18:00:00Z" — mismo formato que env_logger, para que el
+    /// extractor ISO-8601 de h-stats.sh (frescura del dashboard) funcione sobre nuestras líneas.
+    fn utc_stamp() -> String {
+        use time::format_description::well_known::Rfc3339;
+        time::OffsetDateTime::now_utc()
+            .replace_nanosecond(0)
+            .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
+            .format(&Rfc3339)
+            .unwrap_or_default()
+    }
+
     fn hash_suffix(n: f64) -> (f64, &'static str) {
         match n {
             n if n < 1_000.0 => (n, "hash/s"),
