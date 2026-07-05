@@ -6,7 +6,7 @@
 // Based on NVVM 22.0.0
 //
 
-.version 9.2
+.version 8.7
 .target sm_120
 .address_size 64
 
