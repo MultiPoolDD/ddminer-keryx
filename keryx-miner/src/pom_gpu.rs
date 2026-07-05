@@ -195,18 +195,20 @@ impl PomGpuMiner {
 
     /// Search nonces in `[start, start + batch)`. Returns the lowest nonce whose `pom_pow_value`
     /// is `<= target_le`, or None. `target_le` is the header's compact target as 32 LE bytes.
-    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> candle_core::Result<Option<u64>> {
+    /// `h3` salts the pph words host-side (POM_H3_PPH_SALT) — the kernel itself is era-agnostic,
+    /// it folds whatever words it receives, so no PTX change at the H3 gate.
+    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool) -> candle_core::Result<Option<u64>> {
         // CUDA block size for the walk kernel. The walk is memory-latency-bound (256 dependent
         // random VRAM reads/nonce), so occupancy — how many warps hide that latency — is the only
         // launch-side lever. Tunable via POM_BLOCK env (default 256); does NOT change the result
         // (proof stays valid), only how the same work is scheduled.
-        self.mine_with_block(pom_block_size(), pre_pow_hash, timestamp, target_le, start, batch)
+        self.mine_with_block(pom_block_size(), pre_pow_hash, timestamp, target_le, start, batch, h3)
     }
 
     /// Same as [`mine`] but with an explicit CUDA block size — used by the `--bench-pom` harness to
     /// sweep occupancy without the cached env value. Result is identical regardless of block size.
-    pub fn mine_with_block(&self, block: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> candle_core::Result<Option<u64>> {
-        let p = words4(pre_pow_hash);
+    pub fn mine_with_block(&self, block: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool) -> candle_core::Result<Option<u64>> {
+        let p = crate::pom::pph_words_for_era(pre_pow_hash, h3);
         let t = words4(target_le);
         let k = crate::pom::POM_WALK_STEPS;
         let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
@@ -240,11 +242,11 @@ pub fn bench(gguf: &str, dev: u32) -> candle_core::Result<()> {
     let batch: u64 = 1 << 20;
     for &block in &[64u32, 128, 256, 384, 512, 768, 1024] {
         // Warm-up launch (módulo/caché) y luego promedio de varias iteraciones.
-        let _ = m.mine_with_block(block, &pph, 0, &target, 0, batch)?;
+        let _ = m.mine_with_block(block, &pph, 0, &target, 0, batch, true)?;
         let iters = 8u64;
         let t0 = Instant::now();
         for i in 0..iters {
-            let _ = m.mine_with_block(block, &pph, 0, &target, i * batch, batch)?;
+            let _ = m.mine_with_block(block, &pph, 0, &target, i * batch, batch, true)?;
         }
         let secs = t0.elapsed().as_secs_f64();
         let mhs = (iters * batch) as f64 / secs / 1.0e6;
@@ -296,10 +298,10 @@ pub fn is_loading() -> bool {
 
 /// Convenience: search a nonce batch via device `dev`'s installed miner. None if not installed or
 /// no winner. Holds only this device's slot lock (not a global one) so devices mine concurrently.
-pub fn mine(dev: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> Option<u64> {
+pub fn mine(dev: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool) -> Option<u64> {
     let s = slot(dev);
     let g = s.lock().ok()?;
-    g.as_ref()?.mine(pre_pow_hash, timestamp, target_le, start, batch).ok().flatten()
+    g.as_ref()?.mine(pre_pow_hash, timestamp, target_le, start, batch, h3).ok().flatten()
 }
 
 /// Mining-tier identity for rebuilds: (model_id, gguf_path). Set once at startup.
