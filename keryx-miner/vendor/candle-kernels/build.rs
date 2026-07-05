@@ -66,7 +66,14 @@ fn main() {
     if let Ok(target) = std::env::var("TARGET") {
         if target.contains("msvc") {
             is_target_msvc = true;
-            moe_builder = moe_builder.arg("-D_USE_MATH_DEFINES");
+            // Compile the MoE objects against the DYNAMIC MSVC CRT (/MD). nvcc otherwise defaults its
+            // host cl.exe to the STATIC CRT (/MT -> libcmt), which clashes (LNK2038 RuntimeLibrary
+            // mismatch -> LNK1319) with randomx-rs (cmake, /MD) and rustc (/MD) when linking the
+            // keryxcuda cdylib on Windows. The rest of the build is dynamic-CRT, so pin libmoe.a too.
+            moe_builder = moe_builder
+                .arg("-D_USE_MATH_DEFINES")
+                .arg("-Xcompiler")
+                .arg("/MD");
         }
     }
 
