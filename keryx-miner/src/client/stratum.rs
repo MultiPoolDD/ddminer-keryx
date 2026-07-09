@@ -701,8 +701,21 @@ impl StratumHandler {
                         Err(error.into())
                     }
                     ErrorCode::NotSubscribed => {
-                        error!("Got error code {}: {}", code, error);
-                        Err(error.into())
+                        // El bridge del pool responde error 25 a un share cuyo pow no valida
+                        // (p. ej. "pow_value does not match PoM fold") SIN desconectar. Antes lo
+                        // tratábamos como fatal y tirábamos NOSOTROS la conexión — perdiendo todo
+                        // el warmup (índice + modelos) por un share malo puntual. Si ya nos
+                        // aceptaron shares en esta conexión, estamos claramente suscritos:
+                        // descarta el share, cuéntalo y sigue. Solo es fatal de verdad si llega
+                        // sin ningún share aceptado (suscripción realmente rota).
+                        if self.shares_stats.accepted.load(Ordering::SeqCst) > 0 {
+                            error!("Share rejected by pool ({}): {} — discarding and continuing", code, error);
+                            self.shares_stats.stale.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        } else {
+                            error!("Got error code {}: {}", code, error);
+                            Err(error.into())
+                        }
                     }
                 }
             }

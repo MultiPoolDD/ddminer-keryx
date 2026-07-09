@@ -476,12 +476,22 @@ impl WeightIndex {
         // Level 0: hash chunks → leaves (to disk). The raw chunks are NOT retained in RAM; instead
         // we record, per tensor, the canonical chunk index of its first chunk and that chunk's
         // absolute byte offset in the GGUF, so `read_chunk` can `pread` any chunk on demand.
+        // Total de bytes de la sección de datos, para el % del panel (index_build_pct).
+        let data_total = std::fs::metadata(path)
+            .map(|m| m.len().saturating_sub(content.tensor_data_offset))
+            .unwrap_or(0)
+            .max(1);
+        let mut data_done: u64 = 0;
+        INDEX_BUILD_PCT.store(0, std::sync::atomic::Ordering::Relaxed);
         let mut table: Vec<(u64, u64)> = Vec::with_capacity(names.len());
         let mut n_chunks: u64 = 0;
         for name in &names {
             let file_off = content.tensor_data_offset + content.tensor_infos[name].offset;
             let qt = content.tensor(&mut file, name, &device)?;
             let bytes = qt.data()?;
+            data_done += bytes.len() as u64;
+            INDEX_BUILD_PCT
+                .store((data_done * 100 / data_total).min(100) as u8, std::sync::atomic::Ordering::Relaxed);
             let full = bytes.len() / 32;
             if full > 0 {
                 table.push((n_chunks, file_off));
@@ -492,6 +502,7 @@ impl WeightIndex {
                 n_chunks += 1;
             }
         }
+        INDEX_BUILD_PCT.store(255, std::sync::atomic::Ordering::Relaxed); // 255 = inactivo
         if n_chunks == 0 {
             return Err(candle_core::Error::Msg("PoM: model produced 0 chunks".into()));
         }
@@ -628,6 +639,18 @@ pub fn set_index(dev: u32, model_id: [u8; 32], index: WeightIndex) {
 /// Device `dev`'s active possession index, if installed (cheap Arc clone).
 pub fn active_index(dev: u32) -> Option<Arc<WeightIndex>> {
     POM_INDICES.lock().ok()?.get(&dev).map(|(a, _)| a.clone())
+}
+
+/// % del build del índice de posesión en curso (0–100); 255 = ningún build activo. Lo actualiza
+/// `WeightIndex::build_from_gguf` y lo lee el panel de estado (fase "índice" de pom_gpu).
+static INDEX_BUILD_PCT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
+
+/// Some(pct) si hay un build de índice en curso.
+pub fn index_build_pct() -> Option<u8> {
+    match INDEX_BUILD_PCT.load(std::sync::atomic::Ordering::Relaxed) {
+        255 => None,
+        p => Some(p),
+    }
 }
 
 /// Drop device `dev`'s index when it was built from a DIFFERENT model — after an OOM downgrade the

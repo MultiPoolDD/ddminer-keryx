@@ -595,6 +595,20 @@ impl MinerManager {
                     let hr_cell = if rate > 0.0 {
                         let (r, u) = Self::hash_suffix(rate);
                         format!("{GR}{r:>7.2} {u:<7}{RS}")
+                    } else if let Some(phase) = keryx_miner::pom_gpu::load_phase(g.0) {
+                        // GPU en warmup PoM: fase + % en vez de un guion mudo. La fase índice es
+                        // compartida por modelo (el % lo publica el builder en pom).
+                        match phase {
+                            keryx_miner::pom_gpu::LoadPhase::Index => {
+                                let pct = keryx_miner::pom::index_build_pct()
+                                    .map(|p| format!("índice {p:>3}%"))
+                                    .unwrap_or_else(|| "índice…".to_string());
+                                format!("{YL}{pct:<15}{RS}")
+                            }
+                            keryx_miner::pom_gpu::LoadPhase::Vram(p) => {
+                                format!("{YL}{:<15}{RS}", format!("modelo {p:>3}%"))
+                            }
+                        }
                     } else if challenge_active {
                         format!("{YL}{:<15}{RS}", "OPoI/PoM load")
                     } else {

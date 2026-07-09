@@ -97,11 +97,22 @@ impl PomGpuMiner {
         let mut names: Vec<String> = content.tensor_infos.keys().cloned().collect();
         names.sort(); // canonical order — matches pom-rt-builder / the node R_T
 
+        // Total de bytes de la sección de datos (para el % de subida a VRAM del panel).
+        let data_total = file
+            .metadata()
+            .map(|m| m.len().saturating_sub(content.tensor_data_offset))
+            .unwrap_or(0)
+            .max(1);
+        let mut data_done: u64 = 0;
+        set_load_phase(dev, LoadPhase::Vram(0));
+
         let mut tensors: Vec<QTensor> = Vec::with_capacity(names.len());
         let mut bases: Vec<u64> = Vec::new();
         let mut prefix: Vec<u64> = vec![0];
         for name in &names {
             let qt = content.tensor(&mut file, name, &device)?;
+            data_done += qt.storage_size_in_bytes() as u64;
+            set_load_phase(dev, LoadPhase::Vram((data_done * 100 / data_total).min(100) as u8));
             let chunks = (qt.storage_size_in_bytes() / CHUNK_BYTES) as u64;
             if chunks == 0 {
                 tensors.push(qt);
@@ -111,6 +122,7 @@ impl PomGpuMiner {
             prefix.push(prefix.last().unwrap() + chunks);
             tensors.push(qt);
         }
+        clear_load_phase(dev);
         let n_total_chunks = *prefix.last().unwrap();
         if n_total_chunks == 0 {
             return Err(candle_core::Error::Msg("PoM GPU: model produced 0 chunks".into()));
@@ -291,6 +303,33 @@ pub fn is_installed(dev: u32) -> bool {
 /// mining worker. The PoW stall watchdog treats this like an inference pause, not a crash.
 static LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Fase de la carga PoM de un device, para el panel de estado.
+#[derive(Clone, Copy, PartialEq)]
+pub enum LoadPhase {
+    /// Construyendo el índice de posesión en host (compartido por modelo; el % vive en
+    /// `pom::index_build_pct()` porque lo actualiza el builder, no este device).
+    Index,
+    /// Subiendo los pesos del modelo a la VRAM de ESTE device (0–100).
+    Vram(u8),
+}
+
+/// Progreso de carga por device — el panel TUI lo lee para pintar "índice N% / modelo N%"
+/// en las GPUs que aún no minan, en vez de un guion. Se limpia al terminar (ok o error).
+static LOAD_PROGRESS: Mutex<BTreeMap<u32, LoadPhase>> = Mutex::new(BTreeMap::new());
+
+fn set_load_phase(dev: u32, phase: LoadPhase) {
+    LOAD_PROGRESS.lock().unwrap_or_else(|e| e.into_inner()).insert(dev, phase);
+}
+
+fn clear_load_phase(dev: u32) {
+    LOAD_PROGRESS.lock().unwrap_or_else(|e| e.into_inner()).remove(&dev);
+}
+
+/// Fase de carga actual del device (None = no está cargando).
+pub fn load_phase(dev: u32) -> Option<LoadPhase> {
+    LOAD_PROGRESS.lock().unwrap_or_else(|e| e.into_inner()).get(&dev).copied()
+}
+
 /// Whether a PoM model load/rebuild is in progress (worker intentionally paused, not stalled).
 pub fn is_loading() -> bool {
     LOADING.load(std::sync::atomic::Ordering::Relaxed)
@@ -427,6 +466,7 @@ pub fn ensure_installed(dev: u32, daa: u64) -> bool {
     LOADING.store(true, std::sync::atomic::Ordering::Relaxed);
     let ok = ensure_installed_inner(dev, daa);
     LOADING.store(false, std::sync::atomic::Ordering::Relaxed);
+    clear_load_phase(dev); // también en error: que el panel no se quede clavado en un %
     ok
 }
 
@@ -442,6 +482,9 @@ fn ensure_installed_inner(dev: u32, daa: u64) -> bool {
     // An OOM downgrade may have reassigned this device's model — drop a stale (other-model) index
     // so the build below runs for the CURRENT model instead of tripping the N-guard forever.
     crate::pom::invalidate_index_unless(dev, &model_id);
+    if crate::pom::active_index(dev).is_none() {
+        set_load_phase(dev, LoadPhase::Index); // el % vive en pom::index_build_pct()
+    }
     // Build THIS device's possession index once (host, heavy) the first time its PoM activates —
     // deferred from boot so the pre-PoM legacy phase starts immediately. The index is model-specific
     // so each device with a distinct model builds its own.
